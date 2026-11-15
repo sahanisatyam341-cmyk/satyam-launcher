@@ -123,7 +123,7 @@ class MainActivity : Activity() {
             visibility = View.GONE
         }
         search = EditText(this).apply {
-            hint = "Search apps"
+            setHint("Search apps")
             setHintTextColor(0x99FFFFFF.toInt()); setTextColor(Color.WHITE)
             textSize = 16f
             background = round(0x33FFFFFF, 24)
