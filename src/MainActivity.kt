@@ -32,6 +32,7 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.BaseAdapter
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.GridLayout
 import android.widget.GridView
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -52,8 +53,14 @@ class MainActivity : Activity() {
     private lateinit var clock: TextView
     private lateinit var date: TextView
     private lateinit var dock: LinearLayout
+    private lateinit var strip: LinearLayout
+    private lateinit var dots: LinearLayout
     private var apps: List<AppItem> = emptyList()
     private var shown: List<AppItem> = emptyList()
+    private var pinned: MutableList<String> = mutableListOf()
+    private var firstRun = false
+    private var page = 0
+    private var pageCount = 1
     private var open = false
     private val adapter = Adp()
     private val handler = Handler(Looper.getMainLooper())
@@ -63,6 +70,7 @@ class MainActivity : Activity() {
     private lateinit var detector: GestureDetector
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun prefs() = getSharedPreferences("launcher", Context.MODE_PRIVATE)
 
     private fun round(color: Int, r: Int) = GradientDrawable().apply {
         setColor(color); cornerRadius = dp(r).toFloat()
@@ -78,32 +86,49 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         window.statusBarColor = Color.TRANSPARENT
         window.navigationBarColor = Color.TRANSPARENT
+        firstRun = !prefs().contains("pin")
+        pinned = (prefs().getString("pin", "") ?: "").split("\n").filter { it.isNotBlank() }.toMutableList()
         root = FrameLayout(this)
         setContentView(root)
 
-        // ---- Home screen: clock widget + dock ----
+        // ---- Clock widget ----
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(dp(32), dp(18), dp(32), dp(18))
+            setPadding(dp(32), dp(14), dp(32), dp(14))
             background = round(0x55000000, 28)
         }
         clock = TextView(this).apply {
-            textSize = 64f; setTextColor(Color.WHITE)
+            textSize = 56f; setTextColor(Color.WHITE)
             typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
         }
         date = TextView(this).apply { textSize = 16f; setTextColor(Color.WHITE) }
         card.addView(clock); card.addView(date)
         root.addView(card, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(90) })
+            Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(70) })
 
-        val hint = TextView(this).apply {
+        // ---- Home pages (icons) ----
+        val homeArea = FrameLayout(this)
+        strip = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        homeArea.addView(strip, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        root.addView(homeArea, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT).apply {
+            topMargin = dp(235); bottomMargin = dp(150)
+        })
+
+        dots = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
+        root.addView(dots, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM).apply { bottomMargin = dp(128) })
+
+        val swipeHint = TextView(this).apply {
             text = "\u2303"; textSize = 22f; setTextColor(0x99FFFFFF.toInt()); gravity = Gravity.CENTER
         }
-        root.addView(hint, FrameLayout.LayoutParams(
+        root.addView(swipeHint, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.BOTTOM).apply { bottomMargin = dp(112) })
+            Gravity.BOTTOM).apply { bottomMargin = dp(100) })
 
         dock = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -121,6 +146,8 @@ class MainActivity : Activity() {
             background = roundTop(0xF2121218.toInt(), 28)
             setPadding(dp(14), dp(14), dp(14), 0)
             visibility = View.GONE
+            isFocusable = true
+            isFocusableInTouchMode = true
         }
         search = EditText(this).apply {
             setHint("Search apps")
@@ -148,7 +175,7 @@ class MainActivity : Activity() {
             setSelector(android.R.color.transparent)
             setAdapter(adapter)
             setOnItemClickListener { _, _, p, _ -> launch(shown[p]) }
-            setOnItemLongClickListener { _, _, p, _ -> showMenu(shown[p]); true }
+            setOnItemLongClickListener { _, _, p, _ -> showMenu(shown[p], false); true }
         }
         drawer.addView(grid, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
@@ -157,10 +184,17 @@ class MainActivity : Activity() {
 
         detector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
-                if (abs(vy) < abs(vx)) return false
-                if (!open && vy < -1000) { openDrawer(); return true }
-                val atTop = grid.childCount == 0 || (grid.firstVisiblePosition == 0 && grid.getChildAt(0).top >= 0)
-                if (open && vy > 1200 && atTop) { closeDrawer(); return true }
+                if (open) {
+                    val atTop = grid.childCount == 0 || (grid.firstVisiblePosition == 0 && grid.getChildAt(0).top >= 0)
+                    if (vy > 1200 && abs(vy) > abs(vx) && atTop) { closeDrawer(); return true }
+                    return false
+                }
+                if (abs(vx) > abs(vy)) {
+                    if (vx < -800) { goPage(page + 1); return true }
+                    if (vx > 800) { goPage(page - 1); return true }
+                    return false
+                }
+                if (vy < -1000) { openDrawer(); return true }
                 return false
             }
         })
@@ -173,16 +207,19 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        loadApps(); buildDock()
+        loadApps(); buildDock(); buildHome()
         handler.post(tick)
     }
 
     override fun onPause() { super.onPause(); handler.removeCallbacks(tick) }
 
-    override fun onNewIntent(intent: Intent?) { super.onNewIntent(intent); closeDrawer() }
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        closeDrawer(); goPage(0)
+    }
 
     @Deprecated("Deprecated in Java")
-    override fun onBackPressed() { if (open) closeDrawer() }
+    override fun onBackPressed() { if (open) closeDrawer() else goPage(0) }
 
     private fun updateClock() {
         val now = Date()
@@ -194,6 +231,7 @@ class MainActivity : Activity() {
         if (open) return
         open = true
         drawer.visibility = View.VISIBLE
+        drawer.requestFocus()
         drawer.translationY = root.height.toFloat()
         drawer.animate().translationY(0f).setDuration(220).start()
     }
@@ -208,6 +246,25 @@ class MainActivity : Activity() {
             .withEndAction { drawer.visibility = View.GONE }.start()
     }
 
+    private fun goPage(p: Int) {
+        page = p.coerceIn(0, pageCount - 1)
+        strip.animate().translationX(-(page * resources.displayMetrics.widthPixels).toFloat())
+            .setDuration(220).start()
+        updateDots()
+    }
+
+    private fun updateDots() {
+        dots.removeAllViews()
+        if (pageCount < 2) return
+        for (i in 0 until pageCount) {
+            dots.addView(TextView(this).apply {
+                text = "\u25CF"; textSize = 8f
+                setTextColor(if (i == page) Color.WHITE else 0x66FFFFFF)
+                setPadding(dp(4), 0, dp(4), 0)
+            })
+        }
+    }
+
     private fun loadApps() {
         val pm = packageManager
         val q = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
@@ -220,12 +277,49 @@ class MainActivity : Activity() {
                 AppItem(r.loadLabel(pm).toString(), r.activityInfo.packageName, i, r.loadIcon(pm))
             }
             .sortedBy { it.label.lowercase() }
+        if (firstRun && apps.isNotEmpty()) {
+            pinned = apps.take(12).map { it.pkg }.toMutableList()
+            savePins()
+            firstRun = false
+        }
         filter(if (this::search.isInitialized) search.text.toString() else "")
+    }
+
+    private fun savePins() {
+        prefs().edit().putString("pin", pinned.joinToString("\n")).apply()
     }
 
     private fun filter(q: String) {
         shown = if (q.isBlank()) apps else apps.filter { it.label.contains(q.trim(), true) }
         adapter.notifyDataSetChanged()
+    }
+
+    private fun buildHome() {
+        val w = resources.displayMetrics.widthPixels
+        strip.removeAllViews()
+        val items = apps
+        val pages = items.chunked(16).ifEmpty { listOf(emptyList<AppItem>()) }
+        pageCount = pages.size
+        strip.layoutParams = FrameLayout.LayoutParams(w * pageCount, ViewGroup.LayoutParams.MATCH_PARENT)
+        for (pg in pages) {
+            val g = GridLayout(this).apply { columnCount = 4 }
+            for (a in pg) {
+                val cell = appCell(a, 11f)
+                cell.setOnClickListener { launch(a) }
+                cell.setOnLongClickListener { showMenu(a, true); true }
+                g.addView(cell, GridLayout.LayoutParams().apply { width = w / 4; height = dp(88) })
+            }
+            if (pg.isEmpty()) {
+                g.addView(TextView(this).apply {
+                    text = "Koi app nahi mila"
+                    setTextColor(Color.WHITE); gravity = Gravity.CENTER
+                }, GridLayout.LayoutParams().apply { width = w; height = dp(88); columnSpec = GridLayout.spec(0, 4) })
+            }
+            strip.addView(g, LinearLayout.LayoutParams(w, ViewGroup.LayoutParams.MATCH_PARENT))
+        }
+        page = page.coerceIn(0, pageCount - 1)
+        strip.translationX = -(page * w).toFloat()
+        updateDots()
     }
 
     private fun buildDock() {
@@ -252,13 +346,15 @@ class MainActivity : Activity() {
         closeDrawer()
     }
 
-    private fun showMenu(a: AppItem) {
+    private fun showMenu(a: AppItem, onHome: Boolean) {
         AlertDialog.Builder(this).setTitle(a.label)
             .setItems(arrayOf("App info", "Uninstall")) { _, which ->
                 try {
-                    if (which == 0) startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                        Uri.parse("package:${a.pkg}")))
-                    else startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:${a.pkg}")))
+                    if (which == 0) {
+                        startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${a.pkg}")))
+                    } else {
+                        startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:${a.pkg}")))
+                    }
                 } catch (e: Exception) {}
             }.show()
     }
@@ -274,24 +370,26 @@ class MainActivity : Activity() {
         clipToOutline = true
     }
 
+    private fun appCell(a: AppItem, sp: Float): LinearLayout {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        box.addView(iconView(a.icon, dp(54)))
+        box.addView(TextView(this).apply {
+            text = a.label; textSize = sp; setTextColor(Color.WHITE)
+            setShadowLayer(3f, 0f, 1f, Color.BLACK)
+            maxLines = 1; ellipsize = TextUtils.TruncateAt.END
+            gravity = Gravity.CENTER; setPadding(dp(2), dp(5), dp(2), 0)
+        })
+        return box
+    }
+
     private inner class Adp : BaseAdapter() {
         override fun getCount() = shown.size
         override fun getItem(p: Int) = shown[p]
         override fun getItemId(p: Int) = p.toLong()
-        override fun getView(p: Int, cv: View?, parent: ViewGroup): View {
-            val a = shown[p]
-            val box = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER_HORIZONTAL
-                setPadding(0, dp(8), 0, dp(8))
-            }
-            box.addView(iconView(a.icon, dp(56)))
-            box.addView(TextView(this@MainActivity).apply {
-                text = a.label; textSize = 12f; setTextColor(Color.WHITE)
-                maxLines = 1; ellipsize = TextUtils.TruncateAt.END
-                gravity = Gravity.CENTER; setPadding(dp(2), dp(5), dp(2), 0)
-            })
-            return box
-        }
+        override fun getView(p: Int, cv: View?, parent: ViewGroup): View = appCell(shown[p], 12f)
     }
 }
